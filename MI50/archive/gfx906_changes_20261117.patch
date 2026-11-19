@@ -1,0 +1,727 @@
+diff --git a/cmake/backends/hip.cmake b/cmake/backends/hip.cmake
+index a2bad586..1328cf44 100644
+--- a/cmake/backends/hip.cmake
++++ b/cmake/backends/hip.cmake
+@@ -11,6 +11,15 @@ macro(strata_hip_gfx906_toolchain)
+   enable_language(HIP)
+   find_package(hip REQUIRED)
+   find_package(hipblas REQUIRED)
++  # the prompt path rocBLAS solution table (STRATA_ROCBLAS_TUNING): the gfx906 compat build is a CUDA-branch
++  # build, so hip_backend.cmake probe never runs here; find the package and hand the switch to strata_gpu_engine
++  find_package(rocblas CONFIG QUIET)
++  if(TARGET roc::rocblas)
++    set(STRATA_ROCBLAS_AVAILABLE ON)
++  else()
++    set(STRATA_ROCBLAS_AVAILABLE OFF)
++    message(STATUS Strata: rocBLAS CMake package not found; the rocBLAS solution table is unavailable)
++  endif()
+   add_library(CUDA::cudart INTERFACE IMPORTED)
+   target_link_libraries(CUDA::cudart INTERFACE hip::host)
+   target_compile_definitions(CUDA::cudart INTERFACE STRATA_HIP_GFX906=1 __HIP_PLATFORM_AMD__=1)
+diff --git a/cmake/strata_gpu_engine.cmake b/cmake/strata_gpu_engine.cmake
+index 945ca0e5..ef6dc71b 100644
+--- a/cmake/strata_gpu_engine.cmake
++++ b/cmake/strata_gpu_engine.cmake
+@@ -460,7 +460,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_executable(tune_hipblaslt tools/hip/tune_hipblaslt.cpp)
+     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
+   endif()
+-  if(STRATA_ENABLE_HIP AND STRATA_ROCBLAS_AVAILABLE)
++  if((STRATA_ENABLE_HIP OR STRATA_HIP_GFX906) AND STRATA_ROCBLAS_AVAILABLE)
+     # the prompt path's rocBLAS solution table (STRATA_ROCBLAS_TUNING; tools/hip/tune_rocblas makes one)
+     target_compile_definitions(strata_prefill PRIVATE STRATA_ROCBLAS_AVAILABLE=1)
+     target_link_libraries(strata_prefill PRIVATE roc::rocblas)
+@@ -911,7 +911,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   target_link_libraries(native_i8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME native_i8_parity COMMAND native_i8_parity)
+   set_tests_properties(native_i8_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+-  add_executable(mmvf_rows_parity src/kernels/mmvf_rows_parity.cpp)
++  # strata-pack: native_expert_i8 on the packed read layout against the blob (bit parity and time; GPU, synthetic, no model)
++  add_executable(i8_pack_bench src/kernels/i8_pack_bench.cpp)
++  target_include_directories(i8_pack_bench PRIVATE ${_strata_gpu_include_directories})
++  target_link_libraries(i8_pack_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
++    add_executable(mmvf_rows_parity src/kernels/mmvf_rows_parity.cpp)
+   target_include_directories(mmvf_rows_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(mmvf_rows_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME mmvf_rows_parity COMMAND mmvf_rows_parity)
+diff --git a/include/strata/kernels/iq_kernels.hpp b/include/strata/kernels/iq_kernels.hpp
+index a680f5d0..539f6432 100644
+--- a/include/strata/kernels/iq_kernels.hpp
++++ b/include/strata/kernels/iq_kernels.hpp
+@@ -133,6 +133,16 @@ void native_expert_i8_quantize(const float* x, int64_t n_rows, int64_t n_cols, v
+ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                       const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
+                       void* scratch, float* out, void* stream);
++/// strata-pack (the i8 kernels' packed expert image: [tile][stage][row] records, see i8_expert.cuh): is this layout covered, and how many
++/// bytes does one expert's packed image take.
++bool native_expert_i8_pk_supported(const NativeExpertLayout& L) ;
++size_t native_expert_i8_pk_bytes(const NativeExpertLayout& L);
++/// Builds `ne` experts' packed images (blobs from grp_ptr, one image of native_expert_i8_pk_bytes each, back to back) on `stream`.
++void native_expert_i8_pk_build(const NativeExpertLayout& L, const unsigned long long* grp_ptr, int ne, void* pk, void* stream);
++/// native_expert_i8 reading the packed images instead of the blobs: same numbers, one launch's arguments more.
++void native_expert_i8_pk(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
++                         const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
++                         void* scratch, float* out, void* stream, const void* pk);
+ /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
+ /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
+ /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.
+diff --git a/include/strata/platform/hip_compat/strata_hip.h b/include/strata/platform/hip_compat/strata_hip.h
+index 180a1f6d..b20599dd 100644
+--- a/include/strata/platform/hip_compat/strata_hip.h
++++ b/include/strata/platform/hip_compat/strata_hip.h
+@@ -130,6 +130,8 @@ template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, u
+ #define cudaHostGetDevicePointer hipHostGetDevicePointer
+ #define cudaStreamCreate hipStreamCreate
+ #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
++#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
++#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
+ #define cudaStreamDestroy hipStreamDestroy
+ #define cudaStreamSynchronize hipStreamSynchronize
+ #define cudaStreamQuery hipStreamQuery
+diff --git a/src/kernels/cuda/i8_expert.cuh b/src/kernels/cuda/i8_expert.cuh
+index a48ad81c..aea35055 100644
+--- a/src/kernels/cuda/i8_expert.cuh
++++ b/src/kernels/cuda/i8_expert.cuh
+@@ -38,6 +38,15 @@
+ #ifndef I8_BLK_UNROLL
+ #define I8_BLK_UNROLL 1     // unroll factor of the 32-value sub-block loop of one stage (the full unroll hoisted every LDS read: 256 VGPRs and 55-200 spilled on gfx1031)
+ #endif
++#ifndef I8_ST_UNROLL
++#ifndef I8_SMEM_1BUF
++#define I8_SMEM_1BUF 1     // 1: single-buffer the stage records/activations (LDS 20,496 B at TM 2: two blocks per CU), two barriers per stage
++#endif
++#ifndef I8_MINB
++#define I8_MINB 2     // blocks per CU the compiler must fit (2 = cap VGPR at 128, see i8_kernel's launch bounds)
++#endif
++#define I8_ST_UNROLL 2      // unroll factor of the 128-value stage loop (makes the prefetch ring's indices compile-time constants; see i8_kernel)
++#endif
+ #define I8_STR_(x) #x
+ #define I8_PRAGMA_UNROLL(n) _Pragma(I8_STR_(unroll n))
+ constexpr int I8_KS = 128;     // values of K per stage
+@@ -230,6 +239,53 @@ __device__ __forceinline__ void i8_load(I8P blob, const I8Off& of, int st, uint3
+         r[4] = i8_ld16(a);
+     }
+ }
++
++// ---------------------------------------------------------------- strata-pack: the packed expert image (the i8 kernels' read layout)
++// The i8 kernels walk 128 values (one stage) over 64 weight rows, and one tile's rows are `row_bytes` apart in the blob: a warp's
++// 16-byte read therefore lands in up to eight 128-byte lines of eight different rows, and a stage's bytes of a row are re-fetched
++// from a line that half of it (a super-block holds two stages) does not belong to this stage.  The packed image lays a tile's stage
++// out as [64 rows][record], so one (tile, stage) is a contiguous 5-7 KB block: 64 rows x i8_pk_rb() bytes.  Records, 16-byte
++// aligned (d = the record's stage bytes; every stage carries the whole super-block header because the kernel's decode reads it):
++//   Q4_K  80: header 16 (d, dmin, 12 scale bytes) | 64 code bytes of this stage's two sub-block pairs
++//   Q5_K 112: header 16 | the super-block's 32 qh bytes (bit ib of every byte is read by every stage) | 64 code bytes
++//   Q5_1  96: the stage's four 24-byte blocks, already contiguous in the row (a pure copy)
++//   Q8_0 144: the stage's four 34-byte blocks (136) | pad 8
++// The packed image is a SECOND copy of an expert's weights: the decode kernels (native_gu_kernel / native_down_kernel, row_dot)
++// keep reading the original blob unchanged, and only native_expert_i8 reads the packed one (its `pk_base` argument).  The model
++// this was built for (UD-Q4_K_XL) is 43 layers of Q4_K / Q5_1, 4 of Q4_K / Q8_0 and 1 of Q5_K / Q8_0.
++template <int T> __host__ __device__ constexpr int i8_pk_rb() { return T == 12 ? 80 : T == 13 ? 112 : T == 7 ? 96 : 144; }   // bytes per (row, stage)
++/// bytes of one section (gate rows / up rows / down rows) of one expert's packed image: ceil(rows/64) tiles x ns stages x 64 rows
++template <int T> __host__ __device__ inline uint64_t i8_pk_section(int64_t rows, int64_t nvals) {
++    const uint64_t tiles = (uint64_t) ((rows + 63) / 64), ns = (uint64_t) (nvals / I8_KS);
++    return tiles * ns * 64ull * (uint64_t) (i8_pk_rb<T>());
++}
++/// the record of (row, stage) of the packed image: the same pieces as i8_load, out of one record
++template <int T>
++__device__ __forceinline__ void i8_load_pk(I8P rp, int st, int wp, uint32_t (&r)[I8NR<T>]) {
++    I8P b = rp + (uint32_t) ((size_t) st * 64 * i8_pk_rb<T>());
++    if constexpr (T == 12) {
++        r[8] = i8_ldw(b); r[9] = i8_ldw(b + 4); r[10] = i8_ldw(b + 8); r[11] = i8_ldw(b + 12);
++        I8P q = b + 16 + 32 * (wp >> 1);
++#pragma unroll
++        for (int k = 0; k < 8; ++k) r[k] = i8_ldw(q + 4 * k);
++    } else if constexpr (T == 13) {
++        r[8] = i8_ldw(b); r[9] = i8_ldw(b + 4); r[10] = i8_ldw(b + 8); r[11] = i8_ldw(b + 12);
++#pragma unroll
++        for (int k = 0; k < 8; ++k) r[12 + k] = i8_ldw(b + 16 + 4 * k);
++        I8P q = b + 48 + 32 * (wp >> 1);
++#pragma unroll
++        for (int k = 0; k < 8; ++k) r[k] = i8_ldw(q + 4 * k);
++    } else if constexpr (T == 7) {   // Q5_1: the stage's four 24-byte blocks (d, m, qh, 16 code bytes) as they lie
++        I8P a = b + 24 * wp;
++        r[0] = i8_ldw(a + 8); r[1] = i8_ldw(a + 12); r[2] = i8_ldw(a + 16); r[3] = i8_ldw(a + 20); r[4] = i8_ldw(a + 4); r[5] = i8_ldw(a);
++    } else {   // Q8_0: the stage's four 34-byte blocks (d, 32 code bytes)
++        I8P a = b + 34 * wp;
++#pragma unroll
++        for (int k = 0; k < 8; ++k) r[k] = i8_ld32(a + 2 + 4 * k);
++        r[8] = i8_ld16(a);
++    }
++}
++
+ template <int T>
+ __device__ __forceinline__ void i8_pack(const uint32_t (&r)[I8NR<T>], int ib, uint32_t (&w)[I8NW<T>]) {
+     if constexpr (T == 12 || T == 13) {
+@@ -467,9 +523,10 @@ struct I8Smem {
+     static constexpr int BM = 16 * TM;
+     static constexpr int GW = (i8_grid_words(T) + 3) / 4 * 4;
+     static constexpr int SG = i8_sign_type(T) ? 512 : 0;
++    static constexpr int NBUF = I8_SMEM_1BUF ? 1 : 2;
+     static constexpr int SZ_W = 64 * I8_LD, SZ_A = BM * I8_LD, SZ_R = 64 * I8_RS, SZ_D = BM * 4, SZ_S = i8_min_type(T) ? BM * 4 : 0;   // SZ_S: the activation sums of the minimum formats
+-    static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + 2 * SZ_W, o_r = o_a + 2 * SZ_A, o_d = o_r + 2 * SZ_R, o_s = o_d + 2 * SZ_D, o_src = o_s + 2 * SZ_S,
+-                         total = (o_s + 2 * SZ_S + 3) / 4 * 4;   // (the source rows s_src: in the pad words of s_r, see i8_kernel)
++    static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + NBUF * SZ_W, o_r = o_a + NBUF * SZ_A, o_d = o_r + NBUF * SZ_R, o_s = o_d + NBUF * SZ_D, o_src = o_s + NBUF * SZ_S,
++                         total = (o_s + NBUF * SZ_S + 3) / 4 * 4;   // (the source rows s_src: in the pad words of s_r, see i8_kernel)
+     static constexpr size_t bytes = (size_t) total * 4;
+ };
+ 
+@@ -536,11 +593,20 @@ __device__ __forceinline__ int i8_row_t(const uint4 (&w)[2], const uint4& rc, co
+ // rows tx + 16 (2 half + i2)) and one entry of each 8-entry slice (entry ty % 8 + 8 js), so a block with 6 entries runs one slice with all 256 threads busy
+ // where the 16-entry slice left 10 of 16 entry rows computing nothing.  Every (row, entry) accumulates the same terms in the same order: bit-identical output.
+ // The gate/up epilogue needs the gate (row pair 0) and up (row pair 1) values of one entry together: the up half hands them over through shared memory.
+-template <int T, bool GU, int TM, bool NR>
+-__global__ void __launch_bounds__(I8_NT)
++//
++// PF = prefetch depth, in stages ahead (STRATA_I8_PF: 2 = the 3-stage pipeline, 1 = the old one-deep prefetch).  The shared-memory stage buffers stay two: the
++// depth lives in the raw registers (PF sets of them), so the deeper pipeline costs no shared memory (50 KB of the 64 KB of a CUDA CU on the 64-entry tiles) and
++// no extra block.  A stage k is loaded during stage k-PF, converted into shared memory at the end of stage k-1 and read during stage k: with PF 2 the global
++// read of a stage overlaps two stages of dot loop instead of one (the latency of a strided read of an expert blob is longer than one stage of dots).
++// The arithmetic, the stage buffers and the epilogues are untouched, so the output is bit-identical.
++template <int T, bool GU, int TM, bool NR, int PF>
++__global__ void __launch_bounds__(I8_NT, I8_MINB)
+ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
+           const int32_t* __restrict__ tile_off, const int32_t* __restrict__ ent_idx, const block_q8_1* __restrict__ A,
+-          block_q8_1* __restrict__ hq, float* __restrict__ out, NativeExpertLayout L, int bisect) {
++          block_q8_1* __restrict__ hq, float* __restrict__ out, NativeExpertLayout L, int bisect,
++          const unsigned char* __restrict__ pk_base = nullptr, unsigned pk_stride = 0, unsigned pk_up_off = 0, unsigned pk_dn_off = 0) {
++    // pk_base: the packed images of the launch's experts, `pk_stride` bytes apart, in grp_ptr's order (strata-pack); null = the blobs.
++    // pk_up_off / pk_dn_off: the byte offsets of the up section and the down section inside one image (the gate section is at 0).
+     using SM = I8Smem<T, TM>;
+     constexpr int BM = SM::BM;
+     extern __shared__ uint4 i8_dyn[];
+@@ -612,6 +678,14 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
+     if constexpr (GU) row_off = (uint32_t) ((wr >= 32 ? L.up_off : (size_t) 0) + (size_t) (blockIdx.y * 32 + (wr & 31)) * wrb);
+     else row_off = (uint32_t) (L.down_off + (size_t) (blockIdx.y * 64 + wr) * wrb);
+     const I8Off woff = i8_offs<T>(row_off, wp);
++    // the packed image's record row of this thread (strata-pack): section 0 gate / 1 up / 2 down, tile = row / 64
++    I8P pk_row = nullptr;
++    if (pk_base != nullptr) {
++        const int row = GU ? blockIdx.y * 32 + (wr & 31) : blockIdx.y * 64 + wr;
++        const unsigned sec = GU ? (wr >= 32 ? pk_up_off : 0u) : pk_dn_off;
++        pk_row = I8_GPTR(pk_base) + (size_t) g * (size_t) pk_stride + (size_t) sec +
++                 (size_t) ((size_t) (row >> 6) * (size_t) ns * 64u + (size_t) (row & 63)) * (size_t) i8_pk_rb<T>();
++    }
+     // the activation blocks of this thread (the first 4 BM threads, a whole number of waves): q8_1 block (tid & 3) of row (tid >> 2) of the tile, 9 dwords
+     I8P const abase = I8_GPTR(A);
+     const bool a_thr = tid < 4 * BM;
+@@ -621,7 +695,10 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
+         a_vo = (uint32_t) ((size_t) (src >= 0 ? src : 0) * (size_t) ((K / 32) * 36) + (size_t) (tid & 3) * 36);
+     }
+ 
+-    auto load_w = [&](int st, uint32_t (&r)[I8NR<T>]) { i8_load<T>(blob, woff, st, r); };
++    auto load_w = [&](int st, uint32_t (&r)[I8NR<T>]) {
++        if (pk_row != nullptr) i8_load_pk<T>(pk_row, st, wp, r);   // uniform over the block: the packed image or the blob, never both
++        else i8_load<T>(blob, woff, st, r);
++    };
+     auto store_w = [&](int b, int st, const uint32_t (&r)[I8NR<T>]) {
+         uint32_t q[8], w[I8NW<T>];
+         int m0, m1;
+@@ -664,21 +741,28 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
+ #pragma unroll
+         for (int i = 0; i < NI; ++i) acc[j][i] = 0.0f;
+ 
+-    uint32_t wraw[I8NR<T>], ar[9];
++    uint32_t wraw[PF][I8NR<T>], ar[PF][9];
+ #pragma unroll
+-    for (int k = 0; k < 9; ++k) ar[k] = 0;
+-    load_w(0, wraw);
+-    if (bisect == 4) { if (wraw[0] == 0x12345678u) out[0] = 0.0f; return; }
+-    load_a(0, ar);
+-    if (bisect == 5) { if (wraw[0] + ar[0] == 0x12345678u) out[0] = 0.0f; return; }
+-    store_w(0, 0, wraw);
++    for (int p = 0; p < PF; ++p)
++#pragma unroll
++        for (int k = 0; k < 9; ++k) ar[p][k] = 0;
++#pragma unroll
++    for (int p = 0; p < PF; ++p)
++        if (p < ns) { load_w(p, wraw[p]); load_a(p, ar[p]); }
++    if (bisect == 4) { if (wraw[0][0] == 0x12345678u) out[0] = 0.0f; return; }
++    if (bisect == 5) { if (wraw[0][0] + ar[0][0] == 0x12345678u) out[0] = 0.0f; return; }
++    store_w(0, 0, wraw[0]);
+     if (bisect == 6) return;
+-    store_a(0, ar);
++    store_a(0, ar[0]);
+     __syncthreads();
+     if (bisect == 7) return;
++    // the stage loop unrolled by PF, so the ring indices (st % PF) are compile-time constants of each copy: with a runtime index a
++    // register array can only be read through selects, which cost more than the prefetch saved (measured: PF 2 unrolled by 1 was 16%
++    // slower than PF 1).  Unrolled by 2 for PF 1 too, so the two depths compare at the same code shape.
++    I8_PRAGMA_UNROLL(I8_ST_UNROLL)
+     for (int st = 0; st < ns; ++st) {
+-        const int b = st & 1;
+-        if (st + 1 < ns) { load_w(st + 1, wraw); load_a(st + 1, ar); }
++        const int b = SM::NBUF == 1 ? 0 : (st & 1);
++        if (st + PF < ns) { load_w(st + PF, wraw[(st + PF) % PF]); load_a(st + PF, ar[(st + PF) % PF]); }
+         const uint32_t* const W = s_w + b * SM::SZ_W;
+         const uint32_t* const Ab = s_a + b * SM::SZ_A;
+         const uint32_t* const Rb = s_r + b * SM::SZ_R;
+@@ -756,8 +840,14 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
+             }
+         }
+         }
+-        if (st + 1 < ns) { store_w(b ^ 1, st + 1, wraw); store_a(b ^ 1, ar); }
+-        __syncthreads();
++        if constexpr (SM::NBUF == 1) {   // single buffer: every reader of this stage must be done before it is overwritten
++            __syncthreads();
++            if (st + 1 < ns) { store_w(0, st + 1, wraw[(st + 1) % PF]); store_a(0, ar[(st + 1) % PF]); }
++            __syncthreads();
++        } else {
++            if (st + 1 < ns) { store_w(b ^ 1, st + 1, wraw[(st + 1) % PF]); store_a(b ^ 1, ar[(st + 1) % PF]); }
++            __syncthreads();
++        }
+     }
+ 
+     // epilogues
+@@ -1094,6 +1184,63 @@ i8b_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __rest
+ }
+ 
+ // ---------------------------------------------------------------- host side
++// n bytes of a record: 32-bit words where both ends are 4-byte aligned, 2-byte halves otherwise (Q6_K's 210-byte blocks are 2-aligned)
++__device__ __forceinline__ void i8_pk_copy(unsigned char* d, const unsigned char* s, int n) {
++    if ((((uintptr_t) d | (uintptr_t) s) & 3u) == 0) {
++        for (int i = 0; i < n; i += 4) *(uint32_t*) (d + i) = *(const uint32_t*) (s + i);
++    } else {
++        for (int i = 0; i < n; i += 2) *(uint16_t*) (d + i) = *(const uint16_t*) (s + i);
++    }
++}
++// one record's pieces of the pack kernel (the [tile][stage][row] image of a section, see i8_load_pk)
++template <int T>
++__device__ __forceinline__ void i8_pk_piece(unsigned char* d, const unsigned char* s, int st) {
++    if constexpr (T == 12) {
++        i8_pk_copy(d, s, 16);
++        i8_pk_copy(d + 16, s + 16 + 64 * (st & 1), 64);
++    } else if constexpr (T == 13) {
++        i8_pk_copy(d, s, 16);
++        i8_pk_copy(d + 16, s + 16, 32);
++        i8_pk_copy(d + 48, s + 48 + 64 * (st & 1), 64);
++    } else if constexpr (T == 7) {   // Q5_1: the stage is four whole blocks, contiguous in the row: a plain copy
++        i8_pk_copy(d, s, 96);
++    } else {   // Q8_0: four 34-byte blocks (136), 8 bytes of pad
++        i8_pk_copy(d, s, 136);
++        *(uint32_t*) (d + 136) = 0u; *(uint32_t*) (d + 140) = 0u;
++    }
++}
++// one block per (expert, section, tile): ns x 64 records, 256 threads walk them
++template <int TG, int TD>
++__global__ void __launch_bounds__(I8_NT) i8_pack_kernel(const unsigned long long* __restrict__ grp_ptr, int ne, unsigned char* __restrict__ pk,
++                                                        NativeExpertLayout L) {
++    const int ntg = (int) ((L.n_ff + 63) / 64), ntd = (int) ((L.n_embd + 63) / 64), tall = 2 * ntg + ntd;
++    const int e = blockIdx.x / tall, t = blockIdx.x % tall;
++    if (e >= ne) return;
++    const int sec = t < ntg ? 0 : t < 2 * ntg ? 1 : 2;
++    const int tile = sec == 0 ? t : sec == 1 ? t - ntg : t - 2 * ntg;
++    const int rows = sec == 2 ? (int) L.n_embd : (int) L.n_ff;
++    const int ns = (sec == 2 ? (int) L.n_ff : (int) L.n_embd) / I8_KS;
++    const size_t wrb = sec == 2 ? L.d_row : L.gu_row;
++    const size_t soff = sec == 2 ? (size_t) L.down_off : sec == 1 ? (size_t) L.up_off : (size_t) 0;
++    const uint64_t sgu = i8_pk_section<TG>(L.n_ff, L.n_embd);
++    const int rb = sec == 2 ? i8_pk_rb<TD>() : i8_pk_rb<TG>();
++    const int BB = i8_block_bytes(sec == 2 ? TD : TG);
++    const unsigned char* blob = (const unsigned char*) (uintptr_t) grp_ptr[e];
++    unsigned char* const out = pk + (size_t) e * (size_t) (2 * sgu + i8_pk_section<TD>(L.n_embd, L.n_ff)) +
++                              (size_t) (sec == 0 ? 0 : sec == 1 ? sgu : 2 * sgu) + (size_t) tile * ns * 64 * rb;
++    for (int idx = threadIdx.x; idx < ns * 64; idx += I8_NT) {
++        const int st = idx >> 6, r64 = idx & 63, row = tile * 64 + r64;
++        unsigned char* d = out + (size_t) (st * 64 + r64) * rb;
++        if (row >= rows) {   // a tile's tail rows (no pack the kernels cover divides 64: kept for generality)
++            for (int i = 0; i < rb; i += 4) *(uint32_t*) (d + i) = 0u;
++            continue;
++        }
++        const int stp = i8_block_vals(sec == 2 ? TD : TG) == 256 ? (st >> 1) * BB : st * 4 * BB;   // the stage's byte offset in the row
++        const unsigned char* s = blob + soff + (size_t) row * wrb + (size_t) stp;
++        if (sec == 2) i8_pk_piece<TD>(d, s, st); else i8_pk_piece<TG>(d, s, st);
++    }
++}
++
+ struct I8Args {
+     const unsigned long long* grp_ptr;
+     const int32_t *grp_start, *n_groups, *tile_off, *ent_tok, *ent_dst;
+@@ -1104,6 +1251,9 @@ struct I8Args {
+     int64_t tiles_ub;
+     int bisect;
+     bool n8 = false;     // tile codes 2-4: 8-entry slices with two weight rows per thread (see i8_kernel, NR)
++    int pf = 1;          // prefetch depth in stages ahead (STRATA_I8_PF; see i8_kernel)
++    const unsigned char* pk_base = nullptr;   // the packed images of the launch's experts (strata-pack), null = read the blobs
++    unsigned pk_stride = 0, pk_up_off = 0, pk_dn_off = 0;   // bytes between images, and the up / down sections' offsets inside one
+ };
+ 
+ // what the last native_expert_i8 call asked its two launches for (the tile code, the dynamic shared memory in bytes passed as the launch's third argument, and
+@@ -1120,28 +1270,29 @@ void i8_note_launch(bool gu, int tile, size_t bytes) {
+     else { g_i8_last.down_bytes = bytes; g_i8_last.down_err = e; }
+ }
+ 
+-template <int T, bool GU, int TM>
+-void i8_launch_tm(const I8Args& a, cudaStream_t s) {
++// one launch of the tile kernel at a prefetch depth (PF sets of raw registers in flight; the shared-memory buffers stay two)
++template <int T, bool GU, int TM, bool NR, int PF>
++void i8_launch_one(const I8Args& a, cudaStream_t s) {
+     constexpr size_t smem = I8Smem<T, TM>::bytes;
+ #if !defined(__HIPCC__)
+-    if (smem > 48 * 1024) {
+-        cudaFuncSetAttribute(i8_kernel<T, GU, TM, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+-        cudaFuncSetAttribute(i8_kernel<T, GU, TM, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+-    }
++    if (smem > 48 * 1024) cudaFuncSetAttribute(i8_kernel<T, GU, TM, NR, PF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+ #endif
+     const dim3 grid((unsigned) a.tiles_ub, (unsigned) (GU ? a.L.n_ff / 32 : a.L.n_embd / 64));
+-    if (a.n8) {   // 8-entry slices (i8_n8_takes)
+-        if constexpr (GU)
+-            i8_kernel<T, true, TM, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+-        else
+-            i8_kernel<T, false, TM, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
++    if constexpr (GU)
++        i8_kernel<T, true, TM, NR, PF><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect,
++                                                                a.pk_base, a.pk_stride, a.pk_up_off, a.pk_dn_off);
++    else
++        i8_kernel<T, false, TM, NR, PF><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect,
++                                                                 a.pk_base, a.pk_stride, a.pk_up_off, a.pk_dn_off);
++}
++template <int T, bool GU, int TM>
++void i8_launch_tm(const I8Args& a, cudaStream_t s) {
++    if (a.pf >= 2) {
++        if (a.n8) i8_launch_one<T, GU, TM, true, 2>(a, s); else i8_launch_one<T, GU, TM, false, 2>(a, s);
+     } else {
+-        if constexpr (GU)
+-            i8_kernel<T, true, TM, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+-        else
+-            i8_kernel<T, false, TM, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
++        if (a.n8) i8_launch_one<T, GU, TM, true, 1>(a, s); else i8_launch_one<T, GU, TM, false, 1>(a, s);
+     }
+-    i8_note_launch(GU, TM, smem);
++    i8_note_launch(GU, TM, I8Smem<T, TM>::bytes);
+ }
+ template <int T, bool GU>
+ void i8b_launch(const I8Args& a, cudaStream_t s) {
+@@ -1209,3 +1360,27 @@ int i8_env_int(const char* name, int dflt) {
+     const char* v = std::getenv(name);
+     return v != nullptr && v[0] != '\0' ? std::atoi(v) : dflt;
+ }
++
++// ---------------------------------------------------------------- strata-pack: the covered layouts, the size of an image, the build
++bool i8_pk_supported(int gu, int dt) { return (gu == 12 || gu == 13) && (dt == 7 || dt == 8); }   // (UD-Q4_K_XL: Q4_K / Q5_K gate-up, Q5_1 / Q8_0 down)
++size_t i8_pk_expert_bytes(int gu, int dt, const NativeExpertLayout& L) {
++    const uint64_t g = gu == 12 ? i8_pk_section<12>(L.n_ff, L.n_embd) : gu == 13 ? i8_pk_section<13>(L.n_ff, L.n_embd) : 0;
++    const uint64_t d = dt == 7 ? i8_pk_section<7>(L.n_embd, L.n_ff) : dt == 8 ? i8_pk_section<8>(L.n_embd, L.n_ff) : 0;
++    return (size_t) (2 * g + d);
++}
++/// the launch arguments of a packed call: the image stride and the up / down sections' offsets inside one image
++void i8_pk_args(int gu, int dt, const NativeExpertLayout& L, unsigned& stride, unsigned& up_off, unsigned& dn_off) {
++    stride = (unsigned) i8_pk_expert_bytes(gu, dt, L);
++    up_off = (unsigned) (gu == 12 ? i8_pk_section<12>(L.n_ff, L.n_embd) : gu == 13 ? i8_pk_section<13>(L.n_ff, L.n_embd) : 0);
++    dn_off = 2u * up_off;
++}
++void i8_pk_build(const NativeExpertLayout& L, const unsigned long long* grp_ptr, int ne, void* pk, void* stream) {
++    if (ne <= 0 || !i8_pk_supported(L.gu_type, L.d_type)) return;
++    const int ntg = (int) ((L.n_ff + 63) / 64), ntd = (int) ((L.n_embd + 63) / 64);
++    const unsigned grid = (unsigned) ((int64_t) ne * (2 * ntg + ntd));
++    cudaStream_t s = (cudaStream_t) stream;
++    unsigned char* d = (unsigned char*) pk;
++    if (L.gu_type == 12 && L.d_type == 7) i8_pack_kernel<12, 7><<<grid, I8_NT, 0, s>>>(grp_ptr, ne, d, L);
++    else if (L.gu_type == 12 && L.d_type == 8) i8_pack_kernel<12, 8><<<grid, I8_NT, 0, s>>>(grp_ptr, ne, d, L);
++    else if (L.gu_type == 13 && L.d_type == 8) i8_pack_kernel<13, 8><<<grid, I8_NT, 0, s>>>(grp_ptr, ne, d, L);
++}
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index d3295582..8f84b70a 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -6341,9 +6341,9 @@ void native_expert_i8_quantize(const float* x, int64_t n_rows, int64_t n_cols, v
+     check("native_expert_i8_quantize");
+ }
+ 
+-void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+-                      const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
+-                      void* scratch, float* out, void* stream) {
++static void i8_run(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
++                   const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
++                   void* scratch, float* out, void* stream, const void* pk) {
+     if (cap_groups <= 0 || cap_entries <= 0) return;
+     if (!native_expert_i8_supported(L)) {
+         std::fprintf(stderr, "native_expert_i8: gate/up type %d, down type %d at %lld x %lld is not covered\n", L.gu_type, L.d_type,
+@@ -6360,17 +6360,38 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
+     block_q8_1* hq = (block_q8_1*) scratch;
+     const size_t hqb = ((size_t) cap_entries * (size_t) (L.n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;
+     int32_t* tile_off = (int32_t*) ((uint8_t*) scratch + hqb);
+-    int tm = i8_env_int("STRATA_I8_TM", 0);   // research: the tile code (2, 3 or 4 rows of 16 entries per thread -> 32, 48 or 64 entries; 8 = variant B, 128 entries)
++    const int tm_env = i8_env_int("STRATA_I8_TM", 0);   // (0 = let the heuristic choose; see the gfx906 cap below)
++    int tm = tm_env;   // research: the tile code (2, 3 or 4 rows of 16 entries per thread -> 32, 48 or 64 entries; 8 = variant B, 128 entries)
+     const int64_t avg = cap_entries / cap_groups;
+     const bool b_ok = L.n_embd % 128 == 0 && L.n_ff % 64 == 0;
+     if (tm <= 0) tm = (avg >= 96 && b_ok) ? 8 : (int) std::max<int64_t>(2, std::min<int64_t>(4, (avg + 8) / 16));
+     tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
++#ifdef STRATA_HIP_GFX906
++    // this build asks for 2 blocks/CU (I8_SMEM_1BUF=1, I8_MINB=2), which caps VGPR at 128; the heuristic above picks tile 4
++    // at the production entry count and tile 4 spills 27 under that cap (783.0 tok/s on 21K against 946.3 for tile 2), so the
++    // gfx906 default is tile 2.  STRATA_I8_TM overrides it.
++    if (tm_env <= 0 && tm > 2) tm = 2;
++#endif
+     const size_t smem_limit = i8_smem_limit();   // a tile that does not fit the device's shared memory per block falls to the next smaller one
+     while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm) > smem_limit) tm = tm == 8 ? 4 : tm - 1;
+     const int bm = tm == 8 ? 128 : 16 * tm;
+     i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
++    // prefetch depth: 2 = three stages in flight (the upstream default); on gfx906 the extra register set pushes tile 2 past
++    // the 128-VGPR cap that I8_MINB=2 forces, and the spill costs more than the deeper pipeline gains: 21K prefill measured
++    // 863.9 tok/s at tile 2 PF 2 against 946.3 at PF 1 (690.8 at tile 3 PF 2, where the spill is heavier).  So the gfx906
++    // build defaults to one stage ahead; STRATA_I8_PF overrides both.
++#ifdef STRATA_HIP_GFX906
++    const int i8_pf = i8_env_int("STRATA_I8_PF", 1) >= 2 ? 2 : 1;
++#else
++    const int i8_pf = i8_env_int("STRATA_I8_PF", 2) >= 2 ? 2 : 1;
++#endif
+     I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
+-             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm)};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
++             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm),
++             i8_pf, nullptr, 0, 0, 0};
++    if (pk != nullptr) {   // strata-pack: the images of this launch's experts, in grp_ptr's order
++        a.pk_base = (const unsigned char*) pk;
++        i8_pk_args(L.gu_type, L.d_type, L, a.pk_stride, a.pk_up_off, a.pk_dn_off);
++    }   // OWN-I8 prefetch depth (2 = three stages in flight: dot, staged, loading)   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
+     switch (L.gu_type) {
+         case 16: i8_launch<16, true>(tm, a, s); break;
+         case 17: i8_launch<17, true>(tm, a, s); break;
+@@ -6396,6 +6417,23 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
+     check("native_expert_i8/down");
+ }
+ 
++void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
++                      const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
++                      void* scratch, float* out, void* stream) {
++    i8_run(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch, out, stream, nullptr);
++}
++void native_expert_i8_pk(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
++                         const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
++                         void* scratch, float* out, void* stream, const void* pk) {
++    i8_run(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch, out, stream, pk);
++}
++bool native_expert_i8_pk_supported(const NativeExpertLayout& L) { return i8_pk_supported(L.gu_type, L.d_type); }
++size_t native_expert_i8_pk_bytes(const NativeExpertLayout& L) { return i8_pk_expert_bytes(L.gu_type, L.d_type, L); }
++void native_expert_i8_pk_build(const NativeExpertLayout& L, const unsigned long long* grp_ptr, int ne, void* pk, void* stream) {
++    i8_pk_build(L, grp_ptr, ne, pk, stream);
++    check("native_expert_i8_pk_build");
++}
++
+ void native_expert_set_expdec(int on) { g_expdec = on < 0 ? -1 : (on ? 1 : 0); }
+ int native_expert_expdec() { return expdec_mode(); }
+ void native_expert_set_expdec_params(const NativeExpertExpdecParams& p) {
+diff --git a/src/kernels/i8_pack_bench.cpp b/src/kernels/i8_pack_bench.cpp
+new file mode 100644
+index 00000000..0c5ccca1
+--- /dev/null
++++ b/src/kernels/i8_pack_bench.cpp
+@@ -0,0 +1,217 @@
++// src/kernels/i8_pack_bench.cpp - native_expert_i8 on a blob's row-major weights against the same call on strata-pack images
++// (the i8 kernels' packed read layout, i8_expert.cuh): is the output bit-identical, and what does the packed read buy in time.
++//
++//     build/i8_pack_bench [entries] [reps]
++//
++// The case is a UD-Q4_K_XL layer: gate/up Q4_K with down Q5_1 (43 of the model's 48 layers) and Q8_0 (4), n_embd 2560, n_ff 640,
++// 1536 entries over 16 groups (every blob read once), the work of one layer of a 21K prompt.
++#include "strata/kernels/iq_kernels.hpp"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <numeric>
++#include <random>
++#include <vector>
++
++namespace k = strata::kernels;
++
++namespace {
++
++void ck(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "CUDA error in %s: %s\n", what, cudaGetErrorString(e));
++        std::exit(2);
++    }
++}
++
++template <typename T>
++T* dalloc(size_t n) {
++    T* p = nullptr;
++    ck(cudaMalloc(&p, n * sizeof(T)), "alloc");
++    return p;
++}
++
++int block_values(int t) { return t == 20 || t == 6 || t == 8 || t == 7 ? 32 : t == 42 ? 64 : 256; }
++
++// `rows` rows of `n` values of format t, as native_i8_parity's random_rows: random bytes, a finite fp16 scale in every block
++std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
++    const size_t rb = k::iq_row_bytes(t, n), bs = k::iq_row_bytes(t, block_values(t));
++    std::vector<uint8_t> w((size_t) rows * rb);
++    std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 1);
++    for (auto& b : w) b = (uint8_t) byte(rng);
++    for (size_t o = 0; o < w.size(); o += bs) {
++        const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));
++        if (t == 14) {
++            std::memcpy(&w[o + 208], &h, 2);
++            continue;
++        }
++        std::memcpy(&w[o], &h, 2);
++        if (t == 12 || t == 13 || t == 7) {
++            const uint16_t h2 = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));
++            std::memcpy(&w[o + 2], &h2, 2);
++        }
++    }
++    return w;
++}
++
++struct Case {
++    const char* name;
++    int gu, dt;
++    int64_t n_embd, n_ff;
++    int entries, reps;
++};
++
++int run(const Case& c) {
++    const int H = (int) c.n_embd, FF = (int) c.n_ff;
++    const k::NativeExpertLayout L = k::native_expert_layout(c.gu, c.dt, c.n_embd, c.n_ff);
++    if (!k::native_expert_i8_pk_supported(L)) {
++        std::printf("%-18s : strata-pack does not cover gu %d / down %d\n", c.name, c.gu, c.dt);
++        return 0;
++    }
++    const size_t pk_bytes = k::native_expert_i8_pk_bytes(L);
++    std::printf("%-18s : blob %zu B, packed image %zu B (%+.1f%%), %d entries x %d reps\n", c.name, L.bytes, pk_bytes,
++                100.0 * ((double) pk_bytes / (double) L.bytes - 1.0), c.entries, c.reps);
++
++    std::mt19937 rng(1234);
++    const int n_blobs = 16;   // one layer's experts, as a group walks them
++    const int cap = c.entries;
++    const size_t slot = (L.bytes + 255) & ~(size_t) 255;
++    uint8_t* blobs = dalloc<uint8_t>(slot * (size_t) n_blobs);
++    std::vector<std::vector<uint8_t>> host(n_blobs);
++    for (int i = 0; i < n_blobs; ++i) {
++        host[i].assign(L.bytes, 0);
++        const std::vector<uint8_t> g = random_rows(c.gu, FF, H, rng);
++        const std::vector<uint8_t> u = random_rows(c.gu, FF, H, rng);
++        const std::vector<uint8_t> d = random_rows(c.dt, H, FF, rng);
++        std::memcpy(host[i].data(), g.data(), g.size());
++        std::memcpy(host[i].data() + L.up_off, u.data(), u.size());
++        std::memcpy(host[i].data() + L.down_off, d.data(), d.size());
++        ck(cudaMemcpy(blobs + (size_t) i * slot, host[i].data(), L.bytes, cudaMemcpyHostToDevice), "blob");
++    }
++    cudaStream_t s = nullptr;
++
++    // the entries: groups of 16 experts, each with a whole number of 64-row tiles (the tile kernel's BM)
++    std::vector<unsigned long long> p;
++    std::vector<int32_t> st(1, 0);
++    int e = 0;
++    while (e < cap) {
++        const int m = std::min(96, cap - e);   // 16 groups of 96 = every blob read once
++        p.push_back((unsigned long long) (blobs + slot * (size_t) (p.size() % (size_t) n_blobs)));
++        e += m;
++        st.push_back(e);
++    }
++    const int ng = (int) p.size();
++    std::vector<int32_t> dst(cap), tok(cap);
++    std::iota(dst.begin(), dst.end(), 0);
++    std::shuffle(dst.begin(), dst.end(), rng);
++    for (int i = 0; i < cap; ++i) tok[i] = (int) (rng() % 128);   // 128 tokens' activations
++    unsigned long long* ptr = dalloc<unsigned long long>(ng);
++    int32_t* start = dalloc<int32_t>(ng + 1);
++    int32_t* n = dalloc<int32_t>(1);
++    int32_t* ddst = dalloc<int32_t>(cap);
++    int32_t* dtok = dalloc<int32_t>(cap);
++    ck(cudaMemcpy(ptr, p.data(), p.size() * 8, cudaMemcpyHostToDevice), "ptr");
++    ck(cudaMemcpy(start, st.data(), st.size() * 4, cudaMemcpyHostToDevice), "start");
++    ck(cudaMemcpy(n, &ng, 4, cudaMemcpyHostToDevice), "n");
++    ck(cudaMemcpy(ddst, dst.data(), dst.size() * 4, cudaMemcpyHostToDevice), "dst");
++    ck(cudaMemcpy(dtok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice), "tok");
++
++    std::vector<float> x((size_t) cap * H);
++    std::normal_distribution<float> nd(0.f, 1.f);
++    for (auto& v : x) v = nd(rng);
++    float* dx = dalloc<float>(x.size());
++    ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
++    uint8_t* xq8 = dalloc<uint8_t>((size_t) cap * (size_t) (H / 32) * 36);
++    k::native_expert_i8_quantize(dx, cap, H, xq8, s);
++    const size_t scr_bytes = k::native_expert_scratch_bytes(cap, FF);
++    uint8_t* scr = dalloc<uint8_t>(scr_bytes);
++    const size_t out_floats = (size_t) cap * (size_t) H;
++    float* out = dalloc<float>(out_floats);
++
++    // the packed images of the same blobs
++    uint8_t* pk = dalloc<uint8_t>(pk_bytes * (size_t) n_blobs);
++    k::native_expert_i8_pk_build(L, ptr, n_blobs, pk, s);
++    ck(cudaStreamSynchronize(s), "pack build");
++
++    auto call = [&](bool packed) {
++        ck(cudaMemsetAsync(out, 0xFF, out_floats * 4, s), "memset");
++        ck(cudaMemsetAsync(scr, 0, scr_bytes, s), "memset");
++        if (packed) k::native_expert_i8_pk(L, ptr, start, n, ddst, dtok, cap, cap, xq8, scr, out, s, pk);
++        else k::native_expert_i8(L, ptr, start, n, ddst, dtok, cap, cap, xq8, scr, out, s);
++        ck(cudaStreamSynchronize(s), "sync");
++    };
++    auto grab = [&]() {
++        std::vector<float> o(out_floats);
++        ck(cudaMemcpy(o.data(), out, o.size() * 4, cudaMemcpyDeviceToHost), "out");
++        return o;
++    };
++
++    call(false);
++    const std::vector<float> a = grab();
++    call(true);
++    const std::vector<float> b = grab();
++    int same = 0, diff = 0;
++    float worst = 0.0f;
++    for (size_t i = 0; i < a.size(); ++i) {
++        if (std::memcmp(&a[i], &b[i], 4) == 0) ++same;
++        else {
++            ++diff;
++            const float d = std::fabs(a[i] - b[i]) / std::max(1e-6f, std::fabs(a[i]));
++            worst = std::max(worst, d);
++        }
++    }
++    std::printf("   parity: %d floats bit-identical, %d different (worst relative %.3g)\n", same, diff, worst);
++    if (diff != 0) std::printf("   FAIL: the packed image must give the same bits\n");
++
++    cudaEvent_t t0, t1;
++    ck(cudaEventCreate(&t0), "event");
++    ck(cudaEventCreate(&t1), "event");
++    double ms[2] = {0.0, 0.0};
++    const int rounds = 3;
++    for (int r = 0; r < rounds; ++r) {
++        for (int which = 0; which < 2; ++which) {
++            const bool packed = which == 1;
++            ck(cudaEventRecord(t0, s), "record");
++            for (int i = 0; i < c.reps; ++i) call(packed);
++            ck(cudaEventRecord(t1, s), "record");
++            ck(cudaEventSynchronize(t1), "sync");
++            float e_ms = 0.0f;
++            ck(cudaEventElapsedTime(&e_ms, t0, t1), "elapsed");
++            ms[which] += e_ms / (double) c.reps;   // (the double memset of the call is in this too; it is a fraction of a stage)
++        }
++    }
++    ms[0] /= rounds;
++    ms[1] /= rounds;
++    const double macs = (double) cap * ((double) H * 2.0 * FF + (double) FF * H);   // gate + up + down, per entry
++    // the bytes a call reads once: every expert blob (the packed image is the same weights)
++    const double bytes = (double) n_blobs * (double) L.bytes;
++    std::printf("   blob   : %8.2f ms  %6.1f GMAC/s  %6.1f GB/s\n", ms[0], macs / ms[0] / 1e3, bytes / ms[0] / 1e6);
++    std::printf("   packed : %8.2f ms  %6.1f GMAC/s  %6.1f GB/s  %+.1f%% time\n", ms[1], macs / ms[1] / 1e3, bytes / ms[1] / 1e6,
++                100.0 * (ms[1] / ms[0] - 1.0));
++
++    cudaEventDestroy(t0);
++    cudaEventDestroy(t1);
++    cudaFree(blobs); cudaFree(ptr); cudaFree(start); cudaFree(n); cudaFree(ddst); cudaFree(dtok);
++    cudaFree(dx); cudaFree(xq8); cudaFree(scr); cudaFree(out); cudaFree(pk);
++    return diff == 0 ? 0 : 1;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    Case cases[] = {
++        {"Q4_K / Q5_1 down", 12, 7, 2560, 640, 1536, 30},   // 43 of the model's 48 layers
++        {"Q4_K / Q8_0 down", 12, 8, 2560, 640, 1536, 30},   // 4 layers
++    };
++    if (argc > 1) for (Case& c : cases) c.entries = std::atoi(argv[1]);
++    if (argc > 2) for (Case& c : cases) c.reps = std::atoi(argv[2]);
++    int rc = 0;
++    for (const Case& c : cases) rc |= run(c);
++    std::printf(rc == 0 ? "OK\n" : "FAILED\n");
++    return rc;
++}

@@ -6424,6 +6424,12 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
 #endif
     if (tm == 5 && !h_ok) tm = 4;
     if (tm != 5) tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
+#ifdef STRATA_HIP_GFX906
+    // this build asks for 2 blocks/CU (I8_SMEM_1BUF=1, I8_MINB=2), which caps VGPR at 128; the heuristic above picks tile 4 at the
+    // production entry count, and tile 4 spills 27 under that cap (783.0 tok/s on 21K against 946.3 for tile 2), so the gfx906 default
+    // is tile 2.  STRATA_I8_TM overrides it.
+    if (!tm_set && tm > 2) tm = 2;
+#endif
     // Volta (i8_expert_rule.hpp, i8_tile_two_blocks): the big-grid formats read their grid from global memory, and the pick is lowered to the largest tile that keeps two blocks
     // per multiprocessor (a tile set by STRATA_I8_TM is kept; STRATA_I8_SM70=0 turns both off)
     const bool gg = vo.on && i8_gg_type(L.gu_type);
@@ -6434,8 +6440,16 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm, gg) > smem_limit) tm = tm == 8 || tm == 5 ? 4 : tm - 1;
     const int bm = tm == 8 ? 128 : tm == 5 ? 64 : 16 * tm;
     i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
+    // prefetch depth: 2 = three stages in flight (the upstream default); on gfx906 the extra register set pushes tile 2 past the 128-VGPR cap
+    // that I8_MINB=2 forces and the spill costs more than the deeper pipeline gains: 21K prefill measured 863.9 tok/s at tile 2 PF 2 against
+    // 946.3 at PF 1 (690.8 at tile 3 PF 2).  So the gfx906 build defaults to one stage ahead; STRATA_I8_PF overrides both.
+#ifdef STRATA_HIP_GFX906
+    const int i8_pf = i8_env_int("STRATA_I8_PF", 1) >= 2 ? 2 : 1;
+#else
+    const int i8_pf = i8_env_int("STRATA_I8_PF", 2) >= 2 ? 2 : 1;
+#endif
     I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
-             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm), gg};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
+             cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm), gg, i8_pf};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
     switch (L.gu_type) {
         case 16: i8_launch<16, true>(tm, a, s); break;
         case 17: i8_launch<17, true>(tm, a, s); break;

@@ -1,0 +1,8 @@
+ cmake/backends/hip.cmake                        |   9 +
+ cmake/strata_gpu_engine.cmake                   |   8 +-
+ include/strata/kernels/iq_kernels.hpp           |  10 +
+ include/strata/platform/hip_compat/strata_hip.h |   2 +
+ src/kernels/cuda/i8_expert.cuh                  | 243 ++++++++++++++++++++----
+ src/kernels/cuda/iq_kernels.cu                  |  48 ++++-
+ src/kernels/i8_pack_bench.cpp                   | 217 +++++++++++++++++++++
+ 7 files changed, 496 insertions(+), 41 deletions(-)

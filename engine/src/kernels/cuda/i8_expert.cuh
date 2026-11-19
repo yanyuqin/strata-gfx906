@@ -35,6 +35,15 @@
 //     4-byte store, no branch (the old mapping branched per dword); the weight pieces are read with a uniform base plus a per-thread
 //     32-bit offset (global SADDR form) instead of 64-bit address arithmetic per piece;
 //   * a tile whose last entries are empty skips the 16-entry slices that hold no entry (uniform branch; bit-identical for the others).
+#ifndef I8_ST_UNROLL
+#define I8_ST_UNROLL 2      // unroll factor of the 128-value stage loop (makes the prefetch ring's indices compile-time constants; see i8_kernel)
+#endif
+#ifndef I8_SMEM_1BUF
+#define I8_SMEM_1BUF 1      // 1: single-buffer the stage records/activations (LDS 20,496 B at TM 2: two blocks per CU), two barriers per stage
+#endif
+#ifndef I8_MINB
+#define I8_MINB 2           // blocks per CU the compiler must fit (2 = cap VGPR at 128, see i8_kernel's launch bounds)
+#endif
 #ifndef I8_BLK_UNROLL
 #define I8_BLK_UNROLL 1     // unroll factor of the 32-value sub-block loop of one stage (the full unroll hoisted every LDS read: 256 VGPRs and 55-200 spilled on gfx1031)
 #endif
@@ -470,9 +479,10 @@ struct I8Smem {
     static constexpr int BM = 16 * TM;
     static constexpr int GW = GG ? 0 : (i8_grid_words(T) + 3) / 4 * 4;
     static constexpr int SG = i8_sign_type(T) ? 512 : 0;
+    static constexpr int NBUF = I8_SMEM_1BUF ? 1 : 2;
     static constexpr int SZ_W = 64 * I8_LD, SZ_A = BM * I8_LD, SZ_R = 64 * I8_RS, SZ_D = BM * 4, SZ_S = i8_min_type(T) ? BM * 4 : 0;   // SZ_S: the activation sums of the minimum formats
-    static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + 2 * SZ_W, o_r = o_a + 2 * SZ_A, o_d = o_r + 2 * SZ_R, o_s = o_d + 2 * SZ_D, o_src = o_s + 2 * SZ_S,
-                         total = (o_s + 2 * SZ_S + 3) / 4 * 4;   // (the source rows s_src: in the pad words of s_r, see i8_kernel)
+    static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + NBUF * SZ_W, o_r = o_a + NBUF * SZ_A, o_d = o_r + NBUF * SZ_R, o_s = o_d + NBUF * SZ_D, o_src = o_s + NBUF * SZ_S,
+                         total = (o_s + NBUF * SZ_S + 3) / 4 * 4;   // (the source rows s_src: in the pad words of s_r, see i8_kernel)
     static constexpr size_t bytes = (size_t) total * 4;
 };
 
@@ -539,8 +549,12 @@ __device__ __forceinline__ int i8_row_t(const uint4 (&w)[2], const uint4& rc, co
 // rows tx + 16 (2 half + i2)) and one entry of each 8-entry slice (entry ty % 8 + 8 js), so a block with 6 entries runs one slice with all 256 threads busy
 // where the 16-entry slice left 10 of 16 entry rows computing nothing.  Every (row, entry) accumulates the same terms in the same order: bit-identical output.
 // The gate/up epilogue needs the gate (row pair 0) and up (row pair 1) values of one entry together: the up half hands them over through shared memory.
-template <int T, bool GU, int TM, bool NR, bool GG = false>
-__global__ void __launch_bounds__(I8_NT)
+//
+// PF = prefetch depth, in stages ahead (STRATA_I8_PF: 2 = the 3-stage pipeline, 1 = the old one-deep prefetch).  The depth lives in the raw registers (PF sets
+// of them), so the deeper pipeline costs no shared memory.  A stage k is loaded during stage k-PF, converted into shared memory at the end of stage k-1 and
+// read during stage k: with PF 2 the global read of a stage overlaps two stages of dot loop.  Arithmetic, stage buffers and epilogues are untouched.
+template <int T, bool GU, int TM, bool NR, bool GG = false, int PF = 1>
+__global__ void __launch_bounds__(I8_NT, I8_MINB)
 i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
           const int32_t* __restrict__ tile_off, const int32_t* __restrict__ ent_idx, const block_q8_1* __restrict__ A,
           block_q8_1* __restrict__ hq, float* __restrict__ out, NativeExpertLayout L, int bisect) {
@@ -668,21 +682,27 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
 #pragma unroll
         for (int i = 0; i < NI; ++i) acc[j][i] = 0.0f;
 
-    uint32_t wraw[I8NR<T>], ar[9];
+    uint32_t wraw[PF][I8NR<T>], ar[PF][9];
 #pragma unroll
-    for (int k = 0; k < 9; ++k) ar[k] = 0;
-    load_w(0, wraw);
-    if (bisect == 4) { if (wraw[0] == 0x12345678u) out[0] = 0.0f; return; }
-    load_a(0, ar);
-    if (bisect == 5) { if (wraw[0] + ar[0] == 0x12345678u) out[0] = 0.0f; return; }
-    store_w(0, 0, wraw);
+    for (int p = 0; p < PF; ++p)
+#pragma unroll
+        for (int k = 0; k < 9; ++k) ar[p][k] = 0;
+#pragma unroll
+    for (int p = 0; p < PF; ++p)
+        if (p < ns) { load_w(p, wraw[p]); load_a(p, ar[p]); }
+    if (bisect == 4) { if (wraw[0][0] == 0x12345678u) out[0] = 0.0f; return; }
+    if (bisect == 5) { if (wraw[0][0] + ar[0][0] == 0x12345678u) out[0] = 0.0f; return; }
+    store_w(0, 0, wraw[0]);
     if (bisect == 6) return;
-    store_a(0, ar);
+    store_a(0, ar[0]);
     __syncthreads();
     if (bisect == 7) return;
+    // the stage loop unrolled by PF, so the ring indices ((st + k) % PF) are compile-time constants of each copy: with a runtime index a
+    // register array can only be read through selects, which cost more than the prefetch saved (measured: PF 2 unrolled by 1 was 16% slower).
+    I8_PRAGMA_UNROLL(I8_ST_UNROLL)
     for (int st = 0; st < ns; ++st) {
-        const int b = st & 1;
-        if (st + 1 < ns) { load_w(st + 1, wraw); load_a(st + 1, ar); }
+        const int b = SM::NBUF == 1 ? 0 : (st & 1);
+        if (st + PF < ns) { load_w(st + PF, wraw[(st + PF) % PF]); load_a(st + PF, ar[(st + PF) % PF]); }
         const uint32_t* const W = s_w + b * SM::SZ_W;
         const uint32_t* const Ab = s_a + b * SM::SZ_A;
         const uint32_t* const Rb = s_r + b * SM::SZ_R;
@@ -760,8 +780,14 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
             }
         }
         }
-        if (st + 1 < ns) { store_w(b ^ 1, st + 1, wraw); store_a(b ^ 1, ar); }
-        __syncthreads();
+        if constexpr (SM::NBUF == 1) {   // single buffer: every reader of this stage must be done before it is overwritten, and the
+            __syncthreads();             // next stage's converters must not start before the overwrite (two barriers are required, not redundant)
+            if (st + 1 < ns) { store_w(0, st + 1, wraw[(st + 1) % PF]); store_a(0, ar[(st + 1) % PF]); }
+            __syncthreads();
+        } else {
+            if (st + 1 < ns) { store_w(b ^ 1, st + 1, wraw[(st + 1) % PF]); store_a(b ^ 1, ar[(st + 1) % PF]); }
+            __syncthreads();
+        }
     }
 
     // epilogues
@@ -1113,6 +1139,7 @@ struct I8Args {
     int bisect;
     bool n8 = false;     // tile codes 2-4: 8-entry slices with two weight rows per thread (see i8_kernel, NR)
     bool gg = false;     // tile codes 2-4, a big-grid format (i8_gg_type): the grid read from global memory (see I8Smem, GG; Volta)
+    int pf = 1;          // prefetch depth in stages ahead (STRATA_I8_PF; see i8_kernel)
 };
 
 // what the last native_expert_i8 call asked its two launches for (the tile code, the dynamic shared memory in bytes passed as the launch's third argument, and
@@ -1129,35 +1156,40 @@ void i8_note_launch(bool gu, int tile, size_t bytes) {
     else { g_i8_last.down_bytes = bytes; g_i8_last.down_err = e; }
 }
 
-template <int T, bool GU, int TM, bool GG>
+template <int T, bool GU, int TM, bool GG, int PF>
 void i8_launch_tm_g(const I8Args& a, cudaStream_t s) {
     constexpr size_t smem = I8Smem<T, TM, GG>::bytes;
 #if !defined(__HIPCC__)
     if (smem > 48 * 1024) {
-        cudaFuncSetAttribute(i8_kernel<T, GU, TM, false, GG>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        cudaFuncSetAttribute(i8_kernel<T, GU, TM, true, GG>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(i8_kernel<T, GU, TM, false, GG, PF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(i8_kernel<T, GU, TM, true, GG, PF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
     }
 #endif
     const dim3 grid((unsigned) a.tiles_ub, (unsigned) (GU ? a.L.n_ff / 32 : a.L.n_embd / 64));
     if (a.n8) {   // 8-entry slices (i8_n8_takes)
         if constexpr (GU)
-            i8_kernel<T, true, TM, true, GG><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+            i8_kernel<T, true, TM, true, GG, PF><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
         else
-            i8_kernel<T, false, TM, true, GG><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+            i8_kernel<T, false, TM, true, GG, PF><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
     } else {
         if constexpr (GU)
-            i8_kernel<T, true, TM, false, GG><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+            i8_kernel<T, true, TM, false, GG, PF><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
         else
-            i8_kernel<T, false, TM, false, GG><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+            i8_kernel<T, false, TM, false, GG, PF><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
     }
     i8_note_launch(GU, TM, smem);
+}
+template <int T, bool GU, int TM, bool GG>
+void i8_launch_tm_f(const I8Args& a, cudaStream_t s) {
+    if (a.pf >= 2) i8_launch_tm_g<T, GU, TM, GG, 2>(a, s);
+    else i8_launch_tm_g<T, GU, TM, GG, 1>(a, s);
 }
 template <int T, bool GU, int TM>
 void i8_launch_tm(const I8Args& a, cudaStream_t s) {
     if constexpr (i8_gg_type(T)) {
-        if (a.gg) { i8_launch_tm_g<T, GU, TM, true>(a, s); return; }
+        if (a.gg) { i8_launch_tm_f<T, GU, TM, true>(a, s); return; }
     }
-    i8_launch_tm_g<T, GU, TM, false>(a, s);
+    i8_launch_tm_f<T, GU, TM, false>(a, s);
 }
 template <int T, bool GU>
 void i8b_launch(const I8Args& a, cudaStream_t s) {
