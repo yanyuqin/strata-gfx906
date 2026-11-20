@@ -40,7 +40,9 @@
   "--ple-gguf",
   "/data480/models/UD3.1-UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf",
   "--mtp-q4",
-  "all"
+  "all",
+  "--short-read",
+  "0"
  ],
  "log": "/home/yanyq/bench/mi50-0214/logs/engine-mi50-prod.log"
 }

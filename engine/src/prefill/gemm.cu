@@ -100,8 +100,13 @@ __global__ void widen_rows_f16(float* __restrict__ Y, int64_t n, int64_t ldy, in
     const int64_t nb = (n + blockDim.x - 1) / blockDim.x;
     for (int64_t b = nb - 1; b >= 0; --b) {
         const int64_t c = b * blockDim.x + threadIdx.x;
-        const float v = c < n ? __half2float(h[c]) : 0.0f;
+        float v = c < n ? __half2float(h[c]) : 0.0f;
         if (count_nonfinite && c < n && !isfinite(v)) atomicAdd(&g_f16_nonfinite, 1ull);
+        // (#879, the Metal port's hsat): the library wrote this FP16 output itself, so a sum past 65504
+        // arrived here as Inf and was widened to FP32 as Inf.  Saturate it the way hf_sat saturates the
+        // stores this engine converts itself.  Only values that were already non-finite change (a NaN
+        // stays NaN), so a finite answer is bit-identical.
+        if (!isnan(v)) v = fminf(fmaxf(v, -65504.0f), 65504.0f);
         if (c < n && g_f16_range_on_g) f16_range_note_g(1, v);
         __syncthreads();
         if (c < n) y[c] = v;
